@@ -43,8 +43,8 @@ if __name__ == "__main__":
     train_transform = transform_aug if args.aug else transform_no_aug
     test_transform = transform_no_aug
 
-    train_data = PetNoseDataset("images-original/images", "train_noses.txt", transform=train_transform)
-    test_data = PetNoseDataset("images-original/images", "test_noses.txt", transform=test_transform)
+    train_data = PetNoseDataset("oxford-iiit-pet-noses/images-original/images", "oxford-iiit-pet-noses/train_noses.txt", transform=train_transform)
+    test_data = PetNoseDataset("oxford-iiit-pet-noses/images-original/images", "oxford-iiit-pet-noses/test_noses.txt", transform=test_transform)
     train_loader = DataLoader(train_data, batch_size=16, shuffle=True)
     test_loader = DataLoader(test_data, batch_size=16, shuffle=False)
 

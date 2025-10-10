@@ -14,7 +14,7 @@ args = parser.parse_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 transform = transforms.Compose([transforms.Resize((227,227)), transforms.ToTensor()])
-dataset = PetNoseDataset("images-original/images", "test_noses.txt", transform=transform)
+dataset = PetNoseDataset("oxford-iiit-pet-noses/images-original/images", "oxford-iiit-pet-noses/test_noses.txt", transform=transform)
 
 if args.model == "snoutnet": model = SnoutNet()
 elif args.model == "alexnet": model = AlexNetNose()
