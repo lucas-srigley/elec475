@@ -4,9 +4,9 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 from dataset import PetNoseDataset
-from models.SnoutNet import SnoutNet
-from models.AlexNet import AlexNetNose
-from models.VGG16 import VGG16Nose
+from SnoutNet import SnoutNet
+from AlexNet import AlexNetNose
+from VGG16 import VGG16Nose
 
 def train_model(model, train_loader, test_loader, device, num_epochs=10, lr=1e-3):
     model.to(device)

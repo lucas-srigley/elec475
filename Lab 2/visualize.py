@@ -2,9 +2,9 @@ import torch, argparse
 import matplotlib.pyplot as plt
 from torchvision import transforms
 from dataset import PetNoseDataset
-from models.SnoutNet import SnoutNet
-from models.AlexNet import AlexNetNose
-from models.VGG16 import VGG16Nose
+from SnoutNet import SnoutNet
+from AlexNet import AlexNetNose
+from VGG16 import VGG16Nose
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, required=True)

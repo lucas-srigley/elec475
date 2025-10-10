@@ -2,9 +2,9 @@ import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader
 from dataset import PetNoseDataset
-from models.SnoutNet import SnoutNet
-from models.AlexNet import AlexNetNose
-from models.VGG16 import VGG16Nose
+from SnoutNet import SnoutNet
+from AlexNet import AlexNetNose
+from VGG16 import VGG16Nose
 import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
