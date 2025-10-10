@@ -1,0 +1,4 @@
+python train.py --model snoutnet
+python train.py --model snoutnet --aug
+python test.py --model snoutnet --weights snoutnet_no_aug.pth
+python visualize.py --model snoutnet --weights snoutnet_no_aug.pth

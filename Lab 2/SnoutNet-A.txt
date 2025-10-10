@@ -1,0 +1,4 @@
+python train.py --model alexnet
+python train.py --model alexnet --aug
+python test.py --model alexnet --weights alexnet_no_aug.pth
+python visualize.py --model alexnet --weights alexnet_no_aug.pth

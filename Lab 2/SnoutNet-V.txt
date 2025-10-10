@@ -1,0 +1,4 @@
+python train.py --model vgg16
+python train.py --model vgg16 --aug
+python test.py --model vgg16 --weights vgg16_no_aug.pth
+python visualize.py --model vgg16 --weights vgg16_no_aug.pth

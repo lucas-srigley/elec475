@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 class SnoutNet(nn.Module):
     def __init__(self):
@@ -37,10 +36,8 @@ class SnoutNet(nn.Module):
 
         return x
 
-
-if __name__ == "__main__":
-    model = SnoutNet()
-    dummy_input = torch.randn(1, 3, 227, 227)
-    output = model(dummy_input)
-    print("Output shape:", output.shape)
-    print("Output tensor:", output)
+model = SnoutNet()
+dummy_input = torch.randn(1, 3, 227, 227)
+output = model(dummy_input)
+print("Output shape:", output.shape)
+print("Output tensor:", output)
