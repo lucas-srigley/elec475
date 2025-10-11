@@ -1,3 +1,4 @@
-.DS_Store
+*.DS_Store
 Lab\ 2/oxford-iiit-pet-noses/*
-Lab\ 2/.DS_Store
+*.pth
+*.pyc
