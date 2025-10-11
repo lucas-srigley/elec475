@@ -3,8 +3,8 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from dataset import PetNoseDataset
 from SnoutNet import SnoutNet
-from AlexNet import AlexNet
-from VGG16 import VGG16
+from AlexNet import AlexNetNose
+from VGG16 import VGG16Nose
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, required=True)
@@ -18,8 +18,8 @@ test_data = PetNoseDataset("oxford-iiit-pet-noses/images-original/images", "oxfo
 test_loader = DataLoader(test_data, batch_size=16, shuffle=False)
 
 if args.model == "snoutnet": model = SnoutNet()
-elif args.model == "alexnet": model = AlexNet()
-else: model = VGG16()
+elif args.model == "alexnet": model = AlexNetNose()
+else: model = VGG16Nose()
 
 model.load_state_dict(torch.load(args.weights, map_location=device))
 model.to(device); model.eval()
