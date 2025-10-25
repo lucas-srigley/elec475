@@ -19,9 +19,13 @@ class PetNoseDataset(Dataset):
 
     def __getitem__(self, idx):
         image_name, coord = self.annotations[idx]
-        image = Image.open(os.path.join(self.images_dir, image_name)).convert('RGB')
-        w, h = image.size
-        if self.transform: image = self.transform(image)
+        img_path = os.path.join(self.images_dir, image_name)
+        image = Image.open(img_path).convert('RGB')
+        orig_width, orig_height = image.size
+        if self.transform:
+            image = self.transform(image)
         x, y = coord
-        label = torch.tensor([x * (self.target_size[0] / w), y * (self.target_size[1] / h)], dtype=torch.float32)
+        x_scaled = x * (self.target_size[0] / orig_width)
+        y_scaled = y * (self.target_size[1] / orig_height)
+        label = torch.tensor([x_scaled, y_scaled], dtype=torch.float32)
         return image, label

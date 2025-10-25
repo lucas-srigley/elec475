@@ -20,7 +20,17 @@ if args.model == "snoutnet": model = SnoutNet()
 elif args.model == "alexnet": model = AlexNetNose()
 else: model = VGG16Nose()
 
-model.load_state_dict(torch.load(args.weights, map_location=device))
+print(model)
+
+state_dict = torch.load(args.weights, map_location=device)
+if args.model.lower() == "vgg16":
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        k_new = k.replace("vgg.", "")
+        if k_new in model.state_dict():
+            new_state_dict[k_new] = v
+    state_dict = new_state_dict
+model.load_state_dict(state_dict)
 model.to(device); model.eval()
 
 img, label = dataset[0]

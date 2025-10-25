@@ -12,17 +12,35 @@ def train_model(model, train_loader, test_loader, device, num_epochs=10, lr=1e-3
     model.to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    train_losses, val_losses = [], []
+
     for epoch in range(num_epochs):
         model.train()
-        total_loss = 0
-        for imgs, labels in tqdm(train_loader):
-            imgs, labels = imgs.to(device), labels.to(device)
+        running_loss = 0
+        for images, labels in tqdm(train_loader):
+            images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(imgs), labels)
-            loss.backward(); optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {total_loss/len(train_loader):.4f}")
-    return model
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * images.size(0)
+        train_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_loss_total = 0
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                val_loss_total += criterion(outputs, labels).item() * images.size(0)
+        val_loss = val_loss_total / len(test_loader.dataset)
+        val_losses.append(val_loss)
+
+        print(f"Epoch [{epoch+1}/{num_epochs}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+    return model, train_losses, val_losses
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -31,12 +49,14 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=10)
     args = parser.parse_args()
 
-    transform_no_aug = transforms.Compose([transforms.Resize((227,227)), transforms.ToTensor()])
+    transform_no_aug = transforms.Compose([
+        transforms.Resize((227,227)),
+        transforms.ToTensor()
+    ])
+
     transform_aug = transforms.Compose([
         transforms.Resize((227,227)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(0.2,0.2),
-        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor()
     ])
 

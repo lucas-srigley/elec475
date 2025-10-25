@@ -1,2 +1,2 @@
 python ensemble.py
-python visualize.py --model ensemble --weights snoutnet_no_aug.pth
+python visualize.py --model snoutnet --weights snoutnet_no_aug.pth

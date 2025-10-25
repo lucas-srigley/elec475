@@ -5,6 +5,7 @@ from dataset import PetNoseDataset
 from SnoutNet import SnoutNet
 from AlexNet import AlexNetNose
 from VGG16 import VGG16Nose
+import numpy as np
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, required=True)
@@ -12,17 +13,39 @@ parser.add_argument("--weights", type=str, required=True)
 args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-transform = transforms.Compose([transforms.Resize((227,227)), transforms.ToTensor()])
-test_data = PetNoseDataset("oxford-iiit-pet-noses/images-original/images", "oxford-iiit-pet-noses/test_noses.txt", transform=transform)
+transform = transforms.Compose([
+    transforms.Resize((227, 227)),
+    transforms.ToTensor()
+])
+test_data = PetNoseDataset(
+    "oxford-iiit-pet-noses/images-original/images",
+    "oxford-iiit-pet-noses/test_noses.txt",
+    transform=transform
+)
 test_loader = DataLoader(test_data, batch_size=16, shuffle=False)
 
-if args.model == "snoutnet": model = SnoutNet()
-elif args.model == "alexnet": model = AlexNetNose()
-else: model = VGG16Nose()
+if args.model == "snoutnet":
+    model = SnoutNet()
+elif args.model == "alexnet":
+    model = AlexNetNose()
+elif args.model == "vgg16":
+    model = VGG16Nose()
+else:
+    raise ValueError("Model must be one of: snoutnet, alexnet, vgg16")
 
-model.load_state_dict(torch.load(args.weights, map_location=device))
-model.to(device); model.eval()
+state_dict = torch.load(args.weights, map_location=device)
+
+if args.model == "vgg16":
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("vgg."):
+            new_state_dict[k[len("vgg."):]] = v
+        else:
+            new_state_dict[k] = v
+    state_dict = new_state_dict
+
+model.to(device)
+model.eval()
 
 distances = []
 with torch.no_grad():
@@ -32,6 +55,5 @@ with torch.no_grad():
         dist = torch.sqrt(torch.sum((preds - labels)**2, dim=1))
         distances.extend(dist.cpu().numpy())
 
-import numpy as np
 distances = np.array(distances)
 print(f"Localization Accuracy (pixels): Min={distances.min():.2f}, Mean={distances.mean():.2f}, Max={distances.max():.2f}, Std={distances.std():.2f}")

@@ -1,11 +1,14 @@
+import torch
 import torch.nn as nn
 import torchvision.models as models
-
+    
 class VGG16Nose(nn.Module):
     def __init__(self, pretrained=True):
         super(VGG16Nose, self).__init__()
-        self.vgg = models.vgg16(pretrained=pretrained)
-        self.vgg.classifier = nn.Sequential(
+        vgg = models.vgg16(pretrained=pretrained)
+        self.features = vgg.features
+        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))
+        self.classifier = nn.Sequential(
             nn.Linear(512*7*7, 4096),
             nn.ReLU(),
             nn.Dropout(),
@@ -15,4 +18,8 @@ class VGG16Nose(nn.Module):
         )
 
     def forward(self, x):
-        return self.vgg(x)
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x

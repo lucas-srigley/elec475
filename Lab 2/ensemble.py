@@ -15,7 +15,9 @@ test_loader = DataLoader(test_data, batch_size=16, shuffle=False)
 snout = SnoutNet(); alex = AlexNetNose(); vgg = VGG16Nose()
 snout.load_state_dict(torch.load("snoutnet_no_aug.pth", map_location=device))
 alex.load_state_dict(torch.load("alexnet_no_aug.pth", map_location=device))
-vgg.load_state_dict(torch.load("vgg16_no_aug.pth", map_location=device))
+vgg_state = torch.load("vgg16_no_aug.pth", map_location=device)
+vgg_state = {k.replace("vgg.", ""): v for k, v in vgg_state.items()}
+vgg.load_state_dict(vgg_state, strict=False)
 models = [snout.to(device).eval(), alex.to(device).eval(), vgg.to(device).eval()]
 
 all_dists = []
