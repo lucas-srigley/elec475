@@ -33,7 +33,7 @@ class VOCSegmentationDataset(torch.utils.data.Dataset):
     """Wrapper for VOC Segmentation dataset with proper preprocessing"""
     def __init__(self, root, year='2012', image_set='train', transform=None, target_transform=None):
         self.dataset = VOCSegmentation(root=root, year=year, image_set=image_set, 
-                                       download=True, transform=None, target_transform=None)
+                                       download=False, transform=None, target_transform=None)
         self.transform = transform
         self.target_transform = target_transform
         
@@ -350,12 +350,12 @@ def main():
     img_transform, target_transform = get_transforms()
     
     train_dataset = VOCSegmentationDataset(
-        root='./data', year='2012', image_set='train',
+        root='./', year='2012', image_set='train',
         transform=img_transform, target_transform=target_transform
     )
     
     val_dataset = VOCSegmentationDataset(
-        root='./data', year='2012', image_set='val',
+        root='./', year='2012', image_set='val',
         transform=img_transform, target_transform=target_transform
     )
     
