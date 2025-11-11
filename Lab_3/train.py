@@ -398,7 +398,7 @@ def main():
     # 1. distillation_method = 'none'      -> generates best_model_none.pth
     # 2. distillation_method = 'response'  -> generates best_model_response.pth  
     # 3. distillation_method = 'feature'   -> generates best_model_feature.pth
-    distillation_method = 'response'  # Change this to test different methods
+    distillation_method = 'none'  # Auto-set by train_all.py
     
     print(f"\nTraining with distillation method: {distillation_method}")
     print("=" * 50)
