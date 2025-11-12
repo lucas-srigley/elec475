@@ -312,13 +312,25 @@ def main():
         print(f"{method_label:<25} {data['mIoU']:<12.4f} {data['params']:<15,} {data['time']:<20.2f}")
     
     # Visualize predictions for best model
+    # if results:
+    # Map best_method to actual filenames
+    model_file_map = {
+        'Without': 'best_model_none.pth',
+        'Response-based': 'best_model_response.pth',
+        'Feature-based': 'best_model_feature.pth'
+    }
+
     if results:
         best_method = max(results, key=lambda k: results[k]['mIoU'])
-        model_path = f'best_model_{best_method.lower().replace("-", "")}.pth'
-        
+        model_path = model_file_map[best_method]
+
         if os.path.exists(model_path):
             print(f"\nVisualizing predictions from best model: {best_method}")
+            
+            # First create the model
             model = CompactSegmentationModel(num_classes=NUM_CLASSES).to(DEVICE)
+            
+            # Then load the weights
             model.load_state_dict(torch.load(model_path, map_location=DEVICE))
             
             img_transform, target_transform = get_transforms()
@@ -329,6 +341,9 @@ def main():
             
             visualize_predictions(model, val_dataset, num_samples=5, 
                                 save_path=f'predictions_{best_method.lower().replace("-", "")}.png')
+        else:
+            print(f"Error: {model_path} does not exist")
+
     
     print("\n" + "=" * 70)
     print("Testing completed!")
