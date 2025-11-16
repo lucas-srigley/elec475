@@ -1,406 +1,353 @@
-#!/usr/bin/env python3
-"""
-ELEC 475 Lab 4: Testing and Visualization Script
-
-Usage:
-    python test.py
-
-Requirements:
-    - Trained model: clip_resnet50_final.pt
-    - Text caches: val_text_cache.pt
-    - Dataset: coco_data/
-"""
-
-import os
-import sys
-import json
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
-from transformers import CLIPTextModel, CLIPTokenizer
+from torch.utils.data import DataLoader
+from torchvision import transforms
 from PIL import Image
-import numpy as np
-from tqdm import tqdm
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+import json
+from tqdm import tqdm
 
-# Set seeds
-torch.manual_seed(42)
-np.random.seed(42)
+# Import from training script
+from train import Config, CLIPModel, COCOCLIPDataset, compute_recall_at_k
 
-# Device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Device: {device}")
+# Note: Make sure Config paths match your actual folder structure
+# If you get path errors, verify your folder structure matches Config paths
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-# Paths
-MODEL_PATH = 'clip_resnet50_final.pt'
-VAL_IMG_DIR = "coco_data/val2014"
-VAL_CAPTION_FILE = "coco_data/annotations/captions_val2014.json"
-VAL_TEXT_CACHE = "val_text_cache.pt"
-
-# Constants
-CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
-CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
-EMBEDDING_DIM = 512
-BATCH_SIZE = 32
-
-# ============================================================================
-# CHECK FILES
-# ============================================================================
-
-def check_files():
-    """Check if all required files exist."""
-    required_files = [
-        MODEL_PATH,
-        VAL_TEXT_CACHE,
-        VAL_IMG_DIR,
-        VAL_CAPTION_FILE
-    ]
+# ==================== Text Query Retrieval ====================
+@torch.no_grad()
+def retrieve_images_by_text(model, text_query, val_dataset, device, top_k=5):
+    """
+    Given a text query, retrieve top-k most similar images
+    """
+    from transformers import CLIPTokenizer, CLIPTextModel
     
-    missing = []
-    for f in required_files:
-        if not os.path.exists(f):
-            missing.append(f)
+    # Load CLIP text encoder
+    tokenizer = CLIPTokenizer.from_pretrained(Config.CLIP_MODEL)
+    text_encoder = CLIPTextModel.from_pretrained(Config.CLIP_MODEL).to(device)
+    text_encoder.eval()
     
-    if missing:
-        print("\n" + "="*70)
-        print("ERROR: Missing required files!")
-        print("="*70)
-        for f in missing:
-            print(f"  - {f}")
-        print("\nPlease run train.py first to generate these files.")
-        print("="*70)
-        sys.exit(1)
+    # Encode query text
+    inputs = tokenizer(
+        text_query,
+        padding='max_length',
+        max_length=77,
+        truncation=True,
+        return_tensors='pt'
+    ).to(device)
     
-    print("✓ All required files found")
-
-# ============================================================================
-# DATASET CLASS
-# ============================================================================
-
-class COCODataset(Dataset):
-    """COCO Dataset for evaluation."""
+    text_outputs = text_encoder(**inputs)
+    query_embedding = text_outputs.pooler_output
+    query_embedding = F.normalize(query_embedding, p=2, dim=1)
     
-    def __init__(self, img_dir, caption_file, transform=None, text_cache=None):
-        self.img_dir = img_dir
-        self.transform = transform
-        self.text_cache = text_cache
-        
-        with open(caption_file, 'r') as f:
-            coco_data = json.load(f)
-        
-        self.images = {img['id']: img['file_name'] for img in coco_data['images']}
-        self.annotations = [ann for ann in coco_data['annotations']
-                           if ann['image_id'] in self.images]
+    # Get all image embeddings
+    model.eval()
+    all_image_embeds = []
+    all_image_ids = []
     
-    def __len__(self):
-        return len(self.annotations)
+    dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     
-    def __getitem__(self, idx):
-        ann = self.annotations[idx]
-        img_path = os.path.join(self.img_dir, self.images[ann['image_id']])
-        image = Image.open(img_path).convert('RGB')
-        
-        if self.transform:
-            image = self.transform(image)
-        
-        if self.text_cache is not None:
-            return image, self.text_cache[idx], idx, ann['caption']
-        return image, ann['caption'], idx, ann['caption']
-
-# ============================================================================
-# MODEL
-# ============================================================================
-
-class CLIPImageEncoder(nn.Module):
-    """ResNet50 image encoder."""
+    for images, text_embeddings, image_ids in tqdm(dataloader, desc="Computing image embeddings"):
+        images = images.to(device)
+        image_embeds = model.image_encoder(images)
+        all_image_embeds.append(image_embeds.cpu())
+        all_image_ids.extend(image_ids.cpu().numpy())
     
-    def __init__(self, embedding_dim=512):
-        super().__init__()
-        resnet = models.resnet50(pretrained=False)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
-        self.projection = nn.Sequential(
-            nn.Linear(2048, 1024),
-            nn.GELU(),
-            nn.Linear(1024, embedding_dim)
-        )
+    all_image_embeds = torch.cat(all_image_embeds, dim=0)
     
-    def forward(self, x):
-        features = self.backbone(x).squeeze(-1).squeeze(-1)
-        embeddings = self.projection(features)
-        return F.normalize(embeddings, p=2, dim=1)
-
-# ============================================================================
-# EVALUATION
-# ============================================================================
-
-def compute_recall(sim_matrix, k_values=[1, 5, 10]):
-    """Compute Recall@K metrics."""
-    n = sim_matrix.shape[0]
+    # Compute similarities
+    similarities = (query_embedding.cpu() @ all_image_embeds.T).squeeze(0)
     
-    i2t_ranks = [(sim_matrix[i].argsort(descending=True) == i).nonzero()[0].item()
-                 for i in range(n)]
-    t2i_ranks = [(sim_matrix[:, i].argsort(descending=True) == i).nonzero()[0].item()
-                 for i in range(n)]
+    # Get top-k
+    top_k_values, top_k_indices = similarities.topk(top_k)
     
-    results = {}
-    for k in k_values:
-        results[f'I2T_R@{k}'] = sum(r < k for r in i2t_ranks) / n
-        results[f'T2I_R@{k}'] = sum(r < k for r in t2i_ranks) / n
+    # Get corresponding images
+    results = []
+    for idx, score in zip(top_k_indices, top_k_values):
+        image_id = all_image_ids[idx]
+        entry = val_dataset.data[image_id]
+        results.append({
+            'image_id': image_id,
+            'filename': entry['filename'],
+            'caption': entry['caption'],
+            'score': score.item()
+        })
     
     return results
 
-def evaluate_retrieval(model, loader, device, n_samples=1000):
-    """Evaluate retrieval performance."""
-    model.eval()
-    
-    img_embs, txt_embs = [], []
-    count = 0
-    
-    with torch.no_grad():
-        for images, text_emb, _, _ in tqdm(loader, desc="Computing embeddings"):
-            if count >= n_samples:
-                break
-            images = images.to(device)
-            img_embs.append(model(images).cpu())
-            txt_embs.append(text_emb)
-            count += images.size(0)
-    
-    img_embs = torch.cat(img_embs)[:n_samples]
-    txt_embs = torch.cat(txt_embs)[:n_samples]
-    sim_matrix = torch.matmul(img_embs, txt_embs.t())
-    
-    return compute_recall(sim_matrix)
-
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
-
-def text_to_image_retrieval(query_text, model, dataset, tokenizer, 
-                           text_encoder, device, top_k=5, search_size=1000):
-    """Retrieve top-K images for a text query."""
-    model.eval()
-    
-    print(f"\n  Query: '{query_text}'")
-    
-    # Encode query
-    with torch.no_grad():
-        inputs = tokenizer([query_text], padding=True, truncation=True,
-                          max_length=77, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        outputs = text_encoder(**inputs)
-        query_emb = F.normalize(outputs.pooler_output, p=2, dim=1)
-    
-    # Compute similarities
-    similarities = []
-    search_size = min(search_size, len(dataset))
-    
-    with torch.no_grad():
-        for idx in tqdm(range(search_size), desc="  Searching", leave=False):
-            image, _, _, _ = dataset[idx]
-            image = image.unsqueeze(0).to(device)
-            img_emb = model(image)
-            sim = torch.matmul(query_emb, img_emb.t()).item()
-            similarities.append(sim)
-    
-    # Get top-K
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
-    
-    # Visualize
-    fig, axes = plt.subplots(1, top_k, figsize=(15, 3))
-    if top_k == 1:
-        axes = [axes]
-    
-    for i, idx in enumerate(top_indices):
-        image, _, _, _ = dataset[idx]
-        image = image.permute(1, 2, 0).numpy()
-        image = image * np.array(CLIP_STD) + np.array(CLIP_MEAN)
-        image = np.clip(image, 0, 1)
-        
-        axes[i].imshow(image)
-        axes[i].set_title(f"Sim: {similarities[idx]:.3f}", fontsize=10)
-        axes[i].axis('off')
-    
-    plt.suptitle(f"Text Query: '{query_text}'", fontsize=12, y=0.98)
-    plt.tight_layout()
-    filename = f"retrieval_{query_text.replace(' ', '_')}.png"
-    plt.savefig(filename, dpi=200, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ Saved: {filename}")
-
-def zero_shot_classification(image_idx, class_labels, model, dataset,
-                            tokenizer, text_encoder, device):
-    """Zero-shot image classification."""
-    model.eval()
-    
-    print(f"\n  Image index: {image_idx}")
-    
-    # Get image
-    image, _, _, caption = dataset[image_idx]
-    image_display = image.permute(1, 2, 0).numpy()
-    image_display = image_display * np.array(CLIP_STD) + np.array(CLIP_MEAN)
-    image_display = np.clip(image_display, 0, 1)
-    
-    # Encode image
-    with torch.no_grad():
-        image_tensor = image.unsqueeze(0).to(device)
-        img_emb = model(image_tensor)
-    
-    # Encode class labels
-    with torch.no_grad():
-        inputs = tokenizer(class_labels, padding=True, truncation=True,
-                          max_length=77, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        outputs = text_encoder(**inputs)
-        text_embs = F.normalize(outputs.pooler_output, p=2, dim=1)
-    
-    # Compute similarities
-    similarities = torch.matmul(img_emb, text_embs.t()).squeeze(0)
-    similarities = similarities.cpu().numpy()
-    
-    # Get prediction
-    pred_idx = np.argmax(similarities)
-    pred_class = class_labels[pred_idx]
-    
-    # Visualize
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    
-    ax1.imshow(image_display)
-    ax1.set_title(f"Predicted: {pred_class}", fontsize=12, fontweight='bold')
-    ax1.axis('off')
-    
-    colors = ['green' if i == pred_idx else 'steelblue' 
-              for i in range(len(class_labels))]
-    bars = ax2.barh(class_labels, similarities, color=colors)
-    ax2.set_xlabel("Cosine Similarity", fontsize=11)
-    ax2.set_title("Class Probabilities", fontsize=12)
-    ax2.set_xlim(0, 1)
-    
-    # Add value labels
-    for i, (bar, sim) in enumerate(zip(bars, similarities)):
-        ax2.text(sim + 0.02, bar.get_y() + bar.get_height()/2,
-                f'{sim:.3f}', va='center', fontsize=9)
-    
-    plt.tight_layout()
-    filename = f"classification_{image_idx}.png"
-    plt.savefig(filename, dpi=200, bbox_inches='tight')
-    plt.close()
-    
-    print(f"  Caption: \"{caption}\"")
-    print(f"  Predicted: {pred_class} (similarity: {similarities[pred_idx]:.3f})")
-    print(f"  ✓ Saved: {filename}")
-    
-    return pred_class, similarities
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-def main():
-    """Main evaluation pipeline."""
-    
-    print("\n" + "="*70)
-    print("ELEC 475 LAB 4: MODEL TESTING & VISUALIZATION")
-    print("="*70 + "\n")
-    
-    # Check files
-    check_files()
-    
-    # Load model
-    print("\nLoading trained model...")
-    model = CLIPImageEncoder(EMBEDDING_DIM).to(device)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    model.eval()
-    print(f"✓ Model loaded from: {MODEL_PATH}")
+# ==================== Zero-shot Classification ====================
+@torch.no_grad()
+def classify_image(model, image_path, class_labels, device):
+    """
+    Given an image and a list of class labels, classify the image
+    """
+    from transformers import CLIPTokenizer, CLIPTextModel
     
     # Load CLIP text encoder
-    print("\nLoading CLIP text encoder...")
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
-    text_encoder = text_encoder.to(device).eval()
-    print("✓ Text encoder loaded")
+    tokenizer = CLIPTokenizer.from_pretrained(Config.CLIP_MODEL)
+    text_encoder = CLIPTextModel.from_pretrained(Config.CLIP_MODEL).to(device)
+    text_encoder.eval()
     
-    # Load text cache
-    print("\nLoading text embeddings cache...")
-    val_text_cache = torch.load(VAL_TEXT_CACHE)
-    print(f"✓ Cache loaded: {val_text_cache.shape}")
-    
-    # Prepare dataset
-    print("\nPreparing validation dataset...")
+    # Prepare image
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+        transforms.Normalize(mean=Config.CLIP_MEAN, std=Config.CLIP_STD)
     ])
     
-    val_dataset = COCODataset(VAL_IMG_DIR, VAL_CAPTION_FILE,
-                             transform, val_text_cache)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE,
-                           shuffle=False, num_workers=2, pin_memory=True)
+    image = Image.open(image_path).convert('RGB')
+    image_tensor = transform(image).unsqueeze(0).to(device)
     
-    print(f"✓ Dataset ready: {len(val_dataset)} samples")
+    # Encode image
+    model.eval()
+    image_embedding = model.image_encoder(image_tensor)
     
-    # Evaluate retrieval
-    print("\n" + "="*70)
-    print("RETRIEVAL EVALUATION")
-    print("="*70)
+    # Encode class labels
+    text_embeddings = []
+    for label in class_labels:
+        inputs = tokenizer(
+            label,
+            padding='max_length',
+            max_length=77,
+            truncation=True,
+            return_tensors='pt'
+        ).to(device)
+        
+        outputs = text_encoder(**inputs)
+        text_embed = outputs.pooler_output
+        text_embed = F.normalize(text_embed, p=2, dim=1)
+        text_embeddings.append(text_embed)
     
-    metrics = evaluate_retrieval(model, val_loader, device, n_samples=1000)
+    text_embeddings = torch.cat(text_embeddings, dim=0)
     
-    print("\nRecall Metrics (1000 validation samples):")
-    print("-" * 70)
+    # Compute similarities
+    similarities = (image_embedding @ text_embeddings.T).squeeze(0)
+    probs = F.softmax(similarities * 100, dim=0)  # Temperature scaling
+    
+    # Get predictions
+    results = []
+    for label, prob in zip(class_labels, probs):
+        results.append({
+            'label': label,
+            'probability': prob.item()
+        })
+    
+    results = sorted(results, key=lambda x: x['probability'], reverse=True)
+    
+    return results, image
+
+# ==================== Visualization ====================
+def visualize_text_retrieval(query, results, image_dir, save_path=None):
+    """
+    Visualize top-k retrieved images for a text query
+    """
+    fig, axes = plt.subplots(1, len(results), figsize=(4*len(results), 4))
+    if len(results) == 1:
+        axes = [axes]
+    
+    fig.suptitle(f'Query: "{query}"', fontsize=16, fontweight='bold')
+    
+    for idx, (ax, result) in enumerate(zip(axes, results)):
+        image_path = Path(image_dir) / result['filename']
+        image = Image.open(image_path)
+        
+        ax.imshow(image)
+        ax.axis('off')
+        ax.set_title(f"Score: {result['score']:.3f}\n{result['caption'][:50]}...",
+                    fontsize=10)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+def visualize_classification(image, results, save_path=None):
+    """
+    Visualize image classification results
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Show image
+    ax1.imshow(image)
+    ax1.axis('off')
+    ax1.set_title('Input Image', fontsize=14, fontweight='bold')
+    
+    # Show probabilities
+    labels = [r['label'] for r in results]
+    probs = [r['probability'] for r in results]
+    
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(labels)))
+    bars = ax2.barh(labels, probs, color=colors)
+    ax2.set_xlabel('Probability', fontsize=12)
+    ax2.set_title('Classification Results', fontsize=14, fontweight='bold')
+    ax2.set_xlim([0, 1])
+    
+    # Add value labels
+    for bar, prob in zip(bars, probs):
+        width = bar.get_width()
+        ax2.text(width, bar.get_y() + bar.get_height()/2,
+                f'{prob:.3f}',
+                ha='left', va='center', fontsize=10)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+# ==================== Complete Evaluation ====================
+def evaluate_model(checkpoint_path, config):
+    """
+    Complete evaluation of the trained model
+    """
+    device = config.DEVICE
+    
+    print(f"Loading model from {checkpoint_path}...")
+    model = CLIPModel(embedding_dim=config.EMBEDDING_DIM).to(device)
+    
+    if checkpoint_path.endswith('.pt'):
+        # Load from checkpoint or best model
+        if 'best_model' in checkpoint_path:
+            model.load_state_dict(torch.load(checkpoint_path))
+        else:
+            checkpoint = torch.load(checkpoint_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+    
+    model.eval()
+    
+    # Load validation dataset
+    print("\nLoading validation dataset...")
+    transform = transforms.Compose([
+        transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=config.CLIP_MEAN, std=config.CLIP_STD)
+    ])
+    
+    val_dataset = COCOCLIPDataset(
+        config.VAL_IMG_DIR,
+        Path(config.CACHE_DIR) / 'val_text_embeddings.pt',
+        transform=transform
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2
+    )
+    
+    # Compute all embeddings
+    print("\nComputing embeddings...")
+    all_image_embeds = []
+    all_text_embeds = []
+    
+    with torch.no_grad():
+        for images, text_embeddings, _ in tqdm(val_loader):
+            images = images.to(device)
+            text_embeddings = text_embeddings.to(device)
+            
+            image_embeds = model.image_encoder(images)
+            text_embeds = F.normalize(text_embeddings, p=2, dim=1)
+            
+            all_image_embeds.append(image_embeds.cpu())
+            all_text_embeds.append(text_embeds.cpu())
+    
+    all_image_embeds = torch.cat(all_image_embeds, dim=0)
+    all_text_embeds = torch.cat(all_text_embeds, dim=0)
+    
+    # Compute similarity matrix
+    print("\nComputing similarity matrix...")
+    similarity_matrix = all_image_embeds @ all_text_embeds.T
+    
+    # Compute Recall@K metrics
+    print("\nComputing Recall@K metrics...")
+    metrics = compute_recall_at_k(similarity_matrix, k_values=[1, 5, 10])
+    
+    print("\n" + "="*50)
+    print("EVALUATION RESULTS")
+    print("="*50)
     for metric, value in metrics.items():
-        print(f"  {metric}: {value:.4f} ({value*100:.2f}%)")
+        print(f"{metric}: {value:.4f} ({value*100:.2f}%)")
+    print("="*50)
     
-    # Save metrics
-    with open('test_results.txt', 'w') as f:
-        f.write("="*70 + "\n")
-        f.write("ELEC 475 Lab 4: Test Results\n")
-        f.write("="*70 + "\n\n")
-        f.write("Recall Metrics (1000 validation samples):\n")
-        for metric, value in metrics.items():
-            f.write(f"  {metric}: {value:.4f} ({value*100:.2f}%)\n")
-    print("\n✓ Saved: test_results.txt")
+    return model, val_dataset, metrics
+
+# ==================== Main Evaluation Script ====================
+def main():
+    config = Config()
     
-    # Text-to-Image retrieval
-    print("\n" + "="*70)
-    print("TEXT-TO-IMAGE RETRIEVAL")
-    print("="*70)
+    # Path to best model
+    checkpoint_path = Path(config.CHECKPOINT_DIR) / 'best_model.pt'
     
-    queries = ['sport', 'animal', 'food', 'car', 'person', 'beach', 'dog', 'pizza']
+    if not checkpoint_path.exists():
+        print(f"Error: Model checkpoint not found at {checkpoint_path}")
+        print("Please train the model first using train.py")
+        return
+    
+    # Evaluate model
+    model, val_dataset, metrics = evaluate_model(str(checkpoint_path), config)
+    
+    # Example 1: Text-to-Image Retrieval
+    print("\n" + "="*50)
+    print("TEXT-TO-IMAGE RETRIEVAL EXAMPLES")
+    print("="*50)
+    
+    queries = ['sport', 'a cat', 'beach', 'food', 'city']
+    
     for query in queries:
-        text_to_image_retrieval(query, model, val_dataset, tokenizer,
-                               text_encoder, device, top_k=5, search_size=1000)
+        print(f"\nQuery: '{query}'")
+        results = retrieve_images_by_text(
+            model, query, val_dataset, config.DEVICE, top_k=5
+        )
+        
+        # Print results
+        for i, result in enumerate(results, 1):
+            print(f"  {i}. Score: {result['score']:.4f} - {result['caption'][:60]}...")
+        
+        # Visualize
+        save_path = Path(config.CHECKPOINT_DIR) / f'retrieval_{query.replace(" ", "_")}.png'
+        visualize_text_retrieval(query, results, config.VAL_IMG_DIR, save_path)
     
-    # Zero-shot classification
-    print("\n" + "="*70)
-    print("ZERO-SHOT CLASSIFICATION")
-    print("="*70)
+    # Example 2: Zero-shot Image Classification
+    print("\n" + "="*50)
+    print("ZERO-SHOT CLASSIFICATION EXAMPLES")
+    print("="*50)
     
-    class_labels = ['a person', 'an animal', 'a landscape', 'a vehicle', 'food']
+    # Get a random image from validation set
+    import random
+    sample_idx = random.randint(0, len(val_dataset) - 1)
+    image_id = val_dataset.image_ids[sample_idx]
+    entry = val_dataset.data[image_id]
+    image_path = Path(config.VAL_IMG_DIR) / entry['filename']
     
-    # Test on specific indices for reproducibility
-    test_indices = [10, 50, 100, 200, 500]
+    class_labels = [
+        'a photo of a person',
+        'a photo of an animal',
+        'a photo of a landscape',
+        'a photo of food',
+        'a photo of a vehicle',
+        'a photo of a building'
+    ]
     
-    for idx in test_indices:
-        zero_shot_classification(idx, class_labels, model, val_dataset,
-                                tokenizer, text_encoder, device)
+    print(f"\nClassifying image: {entry['filename']}")
+    print(f"True caption: {entry['caption']}")
     
-    print("\n" + "="*70)
-    print("TESTING COMPLETE!")
-    print("="*70)
-    print("\nGenerated files:")
-    print("  - test_results.txt")
-    print("  - retrieval_*.png (8 files)")
-    print("  - classification_*.png (5 files)")
-    print("\nUse these images in your lab report!")
+    results, image = classify_image(model, image_path, class_labels, config.DEVICE)
+    
+    print("\nClassification results:")
+    for result in results:
+        print(f"  {result['label']}: {result['probability']:.4f}")
+    
+    # Visualize
+    save_path = Path(config.CHECKPOINT_DIR) / 'classification_example.png'
+    visualize_classification(image, results, save_path)
+    
+    print("\n" + "="*50)
+    print("Evaluation complete! Visualizations saved to checkpoint directory.")
+    print("="*50)
 
 if __name__ == "__main__":
     main()

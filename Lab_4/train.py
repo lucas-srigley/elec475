@@ -1,206 +1,230 @@
-#!/usr/bin/env python3
-"""
-ELEC 475 Lab 4: Fine-tuning ResNet50 for CLIP
-Complete Training Script
-
-Usage:
-    python train.py
-
-Requirements:
-    - Kaggle API credentials in ~/.kaggle/kaggle.json
-    - GPU enabled in Colab
-    - ~25GB disk space for dataset
-"""
-
-import os
-import sys
-import json
-import time
-import subprocess
-
-# Install dependencies
-print("Installing dependencies...")
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-                      "transformers", "ftfy", "regex", "tqdm"])
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTokenizer, CLIPTextModel
 from PIL import Image
-import numpy as np
+import json
+import os
 from tqdm import tqdm
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
+import gc
 
-# Set seeds
-torch.manual_seed(42)
-np.random.seed(42)
-
-# Device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"\nDevice: {device}")
-if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-else:
-    print("WARNING: No GPU detected! Training will be very slow.")
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-CONFIG = {
-    'batch_size': 32,
-    'num_epochs': 10,
-    'learning_rate': 1e-4,
-    'embedding_dim': 512,
-    'temperature': 0.07,
-    'num_workers': 2,
-    'eval_samples': 1000,  # Number of samples for evaluation
-}
-
-# Paths
-TRAIN_IMG_DIR = "coco_data/train2014"
-VAL_IMG_DIR = "coco_data/val2014"
-TRAIN_CAPTION_FILE = "coco_data/annotations/captions_train2014.json"
-VAL_CAPTION_FILE = "coco_data/annotations/captions_val2014.json"
-
-# CLIP constants
-CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
-CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
-
-print("\nConfiguration:")
-for k, v in CONFIG.items():
-    print(f"  {k}: {v}")
-
-# ============================================================================
-# DATASET DOWNLOAD
-# ============================================================================
-
-def check_kaggle():
-    """Check if Kaggle API is configured."""
-    kaggle_json = os.path.expanduser('~/.kaggle/kaggle.json')
-    if not os.path.exists(kaggle_json):
-        print("\n" + "="*70)
-        print("ERROR: Kaggle API not configured!")
-        print("="*70)
-        print("\nPlease run these commands in your Colab notebook first:")
-        print("\n  from google.colab import files")
-        print("  uploaded = files.upload()  # Upload kaggle.json")
-        print("  !mkdir -p ~/.kaggle")
-        print("  !cp kaggle.json ~/.kaggle/")
-        print("  !chmod 600 ~/.kaggle/kaggle.json")
-        print("\nThen run this script again.")
-        print("="*70)
-        sys.exit(1)
-    print("✓ Kaggle API configured")
-
-def download_dataset():
-    """Download COCO dataset if not present."""
-    if os.path.exists("coco_data") and os.path.exists(TRAIN_IMG_DIR):
-        print("✓ Dataset already downloaded")
-        return
+# ==================== Configuration ====================
+class Config:
+    # Paths - UPDATE THESE TO MATCH YOUR ACTUAL FOLDER STRUCTURE
+    # The paths where your actual images are located
+    TRAIN_IMG_DIR = "/content/drive/MyDrive/ELEC475_Lab_4/coco2014/train2014"  # UPDATE THIS
+    VAL_IMG_DIR = "/content/drive/MyDrive/ELEC475_Lab_4/coco2014/val2014"      # UPDATE THIS
+    TRAIN_CAPTION_FILE = "/content/drive/MyDrive/ELEC475_Lab_4/coco2014/annotations/captions_train2014.json"
+    VAL_CAPTION_FILE = "/content/drive/MyDrive/ELEC475_Lab_4/coco2014/annotations/captions_val2014.json"
     
-    print("\nDownloading COCO 2014 dataset...")
-    print("This will take 15-20 minutes and use ~25GB disk space")
+    # Cache directories for preprocessed embeddings
+    CACHE_DIR = "/content/drive/MyDrive/ELEC475_Lab_4/cache"
     
-    os.system("kaggle datasets download -d jeffaudi/coco-2014-dataset-for-yolov3")
+    # Model parameters
+    CLIP_MODEL = "openai/clip-vit-base-patch32"
+    EMBEDDING_DIM = 512
+    IMAGE_SIZE = 224
     
-    print("\nExtracting dataset...")
-    os.system("unzip -q coco-2014-dataset-for-yolov3.zip -d coco_data")
+    # CLIP normalization values
+    CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
+    CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
     
-    if os.path.exists("coco-2014-dataset-for-yolov3.zip"):
-        os.remove("coco-2014-dataset-for-yolov3.zip")
+    # Training parameters
+    BATCH_SIZE = 64  # Adjust based on GPU memory
+    NUM_EPOCHS = 10
+    LEARNING_RATE = 1e-4
+    WARMUP_EPOCHS = 1
     
-    print("✓ Dataset ready")
+    # Dataset subset (set to None to use full dataset)
+    TRAIN_SUBSET_SIZE = 20000  # Use subset for faster training
+    VAL_SUBSET_SIZE = 2000
+    
+    # Device
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Checkpoint
+    CHECKPOINT_DIR = "/content/drive/MyDrive/ELEC475_Lab_4/checkpoints"
+    SAVE_EVERY = 2  # Save checkpoint every N epochs
 
-# ============================================================================
-# DATASET CLASS
-# ============================================================================
-
-class COCODataset(Dataset):
-    """COCO Dataset for CLIP training."""
+# ==================== Dataset Preprocessing ====================
+def load_coco_annotations(caption_file, subset_size=None):
+    """Load COCO captions and return list of (image_id, caption) pairs"""
+    with open(caption_file, 'r') as f:
+        data = json.load(f)
     
-    def __init__(self, img_dir, caption_file, transform=None, text_cache=None):
-        self.img_dir = img_dir
+    # Create mapping from image_id to captions
+    image_to_captions = {}
+    for ann in data['annotations']:
+        image_id = ann['image_id']
+        if image_id not in image_to_captions:
+            image_to_captions[image_id] = []
+        image_to_captions[image_id].append(ann['caption'])
+    
+    # Create image_id to filename mapping
+    image_info = {img['id']: img['file_name'] for img in data['images']}
+    
+    # Create dataset entries
+    dataset_entries = []
+    for image_id, captions in image_to_captions.items():
+        if image_id in image_info:
+            # Use first caption for training
+            dataset_entries.append({
+                'image_id': image_id,
+                'filename': image_info[image_id],
+                'caption': captions[0],
+                'all_captions': captions
+            })
+    
+    # Apply subset if specified
+    if subset_size is not None and subset_size < len(dataset_entries):
+        np.random.seed(42)
+        indices = np.random.choice(len(dataset_entries), subset_size, replace=False)
+        dataset_entries = [dataset_entries[i] for i in indices]
+    
+    return dataset_entries
+
+def cache_text_embeddings(config):
+    """Pre-compute and cache text embeddings to save time during training"""
+    print("Loading CLIP text encoder...")
+    tokenizer = CLIPTokenizer.from_pretrained(config.CLIP_MODEL)
+    text_encoder = CLIPTextModel.from_pretrained(config.CLIP_MODEL).to(config.DEVICE)
+    text_encoder.eval()
+    
+    os.makedirs(config.CACHE_DIR, exist_ok=True)
+    
+    for split, caption_file, subset_size in [
+        ('train', config.TRAIN_CAPTION_FILE, config.TRAIN_SUBSET_SIZE),
+        ('val', config.VAL_CAPTION_FILE, config.VAL_SUBSET_SIZE)
+    ]:
+        cache_file = os.path.join(config.CACHE_DIR, f'{split}_text_embeddings.pt')
+        
+        if os.path.exists(cache_file):
+            print(f"Cache file for {split} already exists. Skipping...")
+            continue
+        
+        print(f"\nProcessing {split} captions...")
+        entries = load_coco_annotations(caption_file, subset_size)
+        
+        text_embeddings = {}
+        with torch.no_grad():
+            for entry in tqdm(entries, desc=f"Encoding {split} captions"):
+                caption = entry['caption']
+                image_id = entry['image_id']
+                
+                # Tokenize
+                inputs = tokenizer(
+                    caption,
+                    padding='max_length',
+                    max_length=77,
+                    truncation=True,
+                    return_tensors='pt'
+                ).to(config.DEVICE)
+                
+                # Encode
+                outputs = text_encoder(**inputs)
+                text_embedding = outputs.pooler_output.cpu()
+                
+                text_embeddings[image_id] = {
+                    'embedding': text_embedding,
+                    'caption': caption,
+                    'filename': entry['filename']
+                }
+        
+        # Save cache
+        torch.save(text_embeddings, cache_file)
+        print(f"Saved {len(text_embeddings)} text embeddings to {cache_file}")
+        
+        # Clean up
+        del text_embeddings
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    del tokenizer, text_encoder
+    gc.collect()
+    torch.cuda.empty_cache()
+
+# ==================== Dataset Class ====================
+class COCOCLIPDataset(Dataset):
+    def __init__(self, image_dir, cache_file, transform=None, verify_images=True):
+        self.image_dir = image_dir
         self.transform = transform
-        self.text_cache = text_cache
         
-        with open(caption_file, 'r') as f:
-            coco_data = json.load(f)
+        # Load cached embeddings
+        print(f"Loading cached embeddings from {cache_file}...")
+        self.data = torch.load(cache_file)
+        all_image_ids = list(self.data.keys())
         
-        self.images = {img['id']: img['file_name'] for img in coco_data['images']}
-        self.annotations = [ann for ann in coco_data['annotations']
-                           if ann['image_id'] in self.images]
-        
-        print(f"  Loaded {len(self.annotations)} pairs")
+        # Verify which images actually exist
+        if verify_images:
+            print("Verifying image files exist...")
+            self.image_ids = []
+            missing_count = 0
+            
+            for image_id in tqdm(all_image_ids, desc="Checking images"):
+                entry = self.data[image_id]
+                filename = entry['filename']
+                
+                # Handle path separators
+                if '/' in filename or '\\' in filename:
+                    filename = os.path.basename(filename)
+                
+                image_path = os.path.join(self.image_dir, filename)
+                
+                if os.path.exists(image_path):
+                    self.image_ids.append(image_id)
+                else:
+                    missing_count += 1
+            
+            print(f"✓ Found {len(self.image_ids)} valid images")
+            if missing_count > 0:
+                print(f"⚠ Skipped {missing_count} missing images")
+        else:
+            self.image_ids = all_image_ids
+            print(f"Loaded {len(self.image_ids)} samples (no verification)")
     
     def __len__(self):
-        return len(self.annotations)
+        return len(self.image_ids)
     
     def __getitem__(self, idx):
-        ann = self.annotations[idx]
-        img_path = os.path.join(self.img_dir, self.images[ann['image_id']])
-        image = Image.open(img_path).convert('RGB')
+        image_id = self.image_ids[idx]
+        entry = self.data[image_id]
+        
+        # Get filename - handle cases where filename might have path components
+        filename = entry['filename']
+        
+        # If filename contains path separators, extract just the filename
+        if '/' in filename or '\\' in filename:
+            filename = os.path.basename(filename)
+        
+        # Construct full path
+        image_path = os.path.join(self.image_dir, filename)
+        
+        # Load image
+        image = Image.open(image_path).convert('RGB')
         
         if self.transform:
             image = self.transform(image)
         
-        if self.text_cache is not None:
-            return image, self.text_cache[idx], idx
-        return image, ann['caption'], idx
+        text_embedding = entry['embedding'].squeeze(0)
+        
+        return image, text_embedding, image_id
 
-# ============================================================================
-# TEXT EMBEDDING CACHE
-# ============================================================================
-
-def create_text_cache(caption_file, tokenizer, text_encoder, device, cache_file):
-    """Pre-encode all captions."""
-    
-    if os.path.exists(cache_file):
-        print(f"  Loading cache: {cache_file}")
-        return torch.load(cache_file)
-    
-    print(f"  Creating cache: {cache_file}")
-    
-    with open(caption_file, 'r') as f:
-        captions = [ann['caption'] for ann in json.load(f)['annotations']]
-    
-    all_embeddings = []
-    batch_size = 256
-    
-    text_encoder.eval()
-    with torch.no_grad():
-        for i in tqdm(range(0, len(captions), batch_size), desc="  Encoding"):
-            batch = captions[i:i+batch_size]
-            inputs = tokenizer(batch, padding=True, truncation=True,
-                             max_length=77, return_tensors="pt")
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            outputs = text_encoder(**inputs)
-            embeddings = F.normalize(outputs.pooler_output, p=2, dim=1)
-            all_embeddings.append(embeddings.cpu())
-    
-    all_embeddings = torch.cat(all_embeddings, dim=0)
-    torch.save(all_embeddings, cache_file)
-    print(f"  Saved: {cache_file} | Shape: {all_embeddings.shape}")
-    
-    return all_embeddings
-
-# ============================================================================
-# MODEL
-# ============================================================================
-
-class CLIPImageEncoder(nn.Module):
-    """ResNet50 image encoder with projection head."""
-    
+# ==================== Model Architecture ====================
+class ImageEncoder(nn.Module):
     def __init__(self, embedding_dim=512):
         super().__init__()
+        # Load pretrained ResNet50
         resnet = models.resnet50(pretrained=True)
+        
+        # Remove the final classification layer
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        
+        # Projection head (2048 -> 512 -> 512)
         self.projection = nn.Sequential(
             nn.Linear(2048, 1024),
             nn.GELU(),
@@ -208,311 +232,284 @@ class CLIPImageEncoder(nn.Module):
         )
     
     def forward(self, x):
-        features = self.backbone(x).squeeze(-1).squeeze(-1)
+        # Extract features
+        features = self.backbone(x)
+        features = features.view(features.size(0), -1)
+        
+        # Project to embedding space
         embeddings = self.projection(features)
-        return F.normalize(embeddings, p=2, dim=1)
+        
+        # L2 normalize
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        
+        return embeddings
 
-# ============================================================================
-# LOSS
-# ============================================================================
-
-class InfoNCELoss(nn.Module):
-    """InfoNCE contrastive loss for CLIP."""
-    
-    def __init__(self, temperature=0.07):
+class CLIPModel(nn.Module):
+    def __init__(self, embedding_dim=512):
         super().__init__()
-        self.temperature = temperature
-        self.ce_loss = nn.CrossEntropyLoss()
+        self.image_encoder = ImageEncoder(embedding_dim)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
     
-    def forward(self, image_emb, text_emb):
-        image_emb = F.normalize(image_emb, p=2, dim=1)
-        text_emb = F.normalize(text_emb, p=2, dim=1)
-        logits = torch.matmul(image_emb, text_emb.t()) / self.temperature
-        labels = torch.arange(len(image_emb), device=image_emb.device)
-        loss = (self.ce_loss(logits, labels) + self.ce_loss(logits.t(), labels)) / 2
-        return loss
+    def forward(self, images, text_embeddings):
+        # Encode images
+        image_embeddings = self.image_encoder(images)
+        
+        # Normalize text embeddings (they're already pre-computed)
+        text_embeddings = F.normalize(text_embeddings, p=2, dim=1)
+        
+        # Compute logit scale
+        logit_scale = self.logit_scale.exp()
+        
+        return image_embeddings, text_embeddings, logit_scale
 
-# ============================================================================
-# TRAINING
-# ============================================================================
+# ==================== Loss Function ====================
+def clip_loss(image_embeddings, text_embeddings, logit_scale):
+    """
+    InfoNCE loss for CLIP
+    
+    For each image-text pair in the batch:
+    - Positive: the paired text
+    - Negatives: all other texts in the batch
+    """
+    # Compute similarity matrix
+    logits = logit_scale * image_embeddings @ text_embeddings.T
+    
+    # Labels are diagonal (each image matches its corresponding text)
+    batch_size = image_embeddings.shape[0]
+    labels = torch.arange(batch_size, device=image_embeddings.device)
+    
+    # Symmetric loss: image-to-text and text-to-image
+    loss_i2t = F.cross_entropy(logits, labels)
+    loss_t2i = F.cross_entropy(logits.T, labels)
+    
+    loss = (loss_i2t + loss_t2i) / 2
+    
+    return loss
 
-def train_epoch(model, loader, criterion, optimizer, device, epoch):
-    """Train one epoch."""
+# ==================== Training ====================
+def train_one_epoch(model, dataloader, optimizer, device, epoch):
     model.train()
     total_loss = 0
     
-    pbar = tqdm(loader, desc=f"Epoch {epoch}/{CONFIG['num_epochs']}")
-    for images, text_emb, _ in pbar:
-        images, text_emb = images.to(device), text_emb.to(device)
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    for images, text_embeddings, _ in pbar:
+        images = images.to(device)
+        text_embeddings = text_embeddings.to(device)
         
-        image_emb = model(images)
-        loss = criterion(image_emb, text_emb)
+        # Forward pass
+        image_embeddings, text_embeddings, logit_scale = model(images, text_embeddings)
         
+        # Compute loss
+        loss = clip_loss(image_embeddings, text_embeddings, logit_scale)
+        
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        pbar.set_postfix({'loss': loss.item()})
     
-    return total_loss / len(loader)
+    return total_loss / len(dataloader)
 
-def validate(model, loader, criterion, device):
-    """Validate the model."""
+@torch.no_grad()
+def validate(model, dataloader, device):
     model.eval()
     total_loss = 0
     
-    with torch.no_grad():
-        for images, text_emb, _ in tqdm(loader, desc="Validating", leave=False):
-            images, text_emb = images.to(device), text_emb.to(device)
-            image_emb = model(images)
-            loss = criterion(image_emb, text_emb)
-            total_loss += loss.item()
+    all_image_embeds = []
+    all_text_embeds = []
     
-    return total_loss / len(loader)
+    for images, text_embeddings, _ in tqdm(dataloader, desc="Validating"):
+        images = images.to(device)
+        text_embeddings = text_embeddings.to(device)
+        
+        # Forward pass
+        image_embeddings, text_embeddings, logit_scale = model(images, text_embeddings)
+        
+        # Compute loss
+        loss = clip_loss(image_embeddings, text_embeddings, logit_scale)
+        total_loss += loss.item()
+        
+        # Collect embeddings
+        all_image_embeds.append(image_embeddings.cpu())
+        all_text_embeds.append(text_embeddings.cpu())
+    
+    # Concatenate all embeddings
+    all_image_embeds = torch.cat(all_image_embeds, dim=0)
+    all_text_embeds = torch.cat(all_text_embeds, dim=0)
+    
+    return total_loss / len(dataloader), all_image_embeds, all_text_embeds
 
-# ============================================================================
-# EVALUATION
-# ============================================================================
-
-def compute_recall(sim_matrix, k_values=[1, 5, 10]):
-    """Compute Recall@K metrics."""
-    n = sim_matrix.shape[0]
+# ==================== Evaluation Metrics ====================
+def compute_recall_at_k(similarity_matrix, k_values=[1, 5, 10]):
+    """
+    Compute Recall@K for both I2T and T2I retrieval
     
-    i2t_ranks = [(sim_matrix[i].argsort(descending=True) == i).nonzero()[0].item()
-                 for i in range(n)]
-    t2i_ranks = [(sim_matrix[:, i].argsort(descending=True) == i).nonzero()[0].item()
-                 for i in range(n)]
-    
+    similarity_matrix: (num_images, num_texts) cosine similarity
+    """
     results = {}
+    
+    # Image to Text retrieval
     for k in k_values:
-        results[f'I2T_R@{k}'] = sum(r < k for r in i2t_ranks) / n
-        results[f'T2I_R@{k}'] = sum(r < k for r in t2i_ranks) / n
+        # Get top-k text indices for each image
+        top_k_indices = similarity_matrix.topk(k, dim=1)[1]
+        
+        # Check if correct text (diagonal) is in top-k
+        correct = torch.zeros(similarity_matrix.shape[0], dtype=torch.bool)
+        for i in range(similarity_matrix.shape[0]):
+            if i in top_k_indices[i]:
+                correct[i] = True
+        
+        recall = correct.float().mean().item()
+        results[f'I2T_R@{k}'] = recall
+    
+    # Text to Image retrieval
+    for k in k_values:
+        # Get top-k image indices for each text
+        top_k_indices = similarity_matrix.T.topk(k, dim=1)[1]
+        
+        # Check if correct image (diagonal) is in top-k
+        correct = torch.zeros(similarity_matrix.shape[0], dtype=torch.bool)
+        for i in range(similarity_matrix.shape[0]):
+            if i in top_k_indices[i]:
+                correct[i] = True
+        
+        recall = correct.float().mean().item()
+        results[f'T2I_R@{k}'] = recall
     
     return results
 
-def evaluate_retrieval(model, loader, device, n_samples=1000):
-    """Evaluate retrieval performance."""
-    model.eval()
-    
-    img_embs, txt_embs = [], []
-    count = 0
-    
-    with torch.no_grad():
-        for images, text_emb, _ in tqdm(loader, desc="Evaluating", leave=False):
-            if count >= n_samples:
-                break
-            images = images.to(device)
-            img_embs.append(model(images).cpu())
-            txt_embs.append(text_emb)
-            count += images.size(0)
-    
-    img_embs = torch.cat(img_embs)[:n_samples]
-    txt_embs = torch.cat(txt_embs)[:n_samples]
-    sim_matrix = torch.matmul(img_embs, txt_embs.t())
-    
-    return compute_recall(sim_matrix)
-
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
-
-def plot_loss_curves(train_losses, val_losses):
-    """Plot and save loss curves."""
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, 'o-', label='Train Loss', linewidth=2)
-    plt.plot(val_losses, 's-', label='Val Loss', linewidth=2)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Loss', fontsize=12)
-    plt.title('Training and Validation Loss', fontsize=14)
-    plt.legend(fontsize=11)
-    plt.grid(True, alpha=0.3)
-    plt.savefig('loss_curves.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print("✓ Saved: loss_curves.png")
-
-def visualize_sample(dataset):
-    """Visualize a random sample."""
-    idx = np.random.randint(len(dataset))
-    img, _, _ = dataset[idx]
-    
-    img = img.permute(1, 2, 0).numpy()
-    img = img * np.array(CLIP_STD) + np.array(CLIP_MEAN)
-    img = np.clip(img, 0, 1)
-    
-    plt.figure(figsize=(5, 5))
-    plt.imshow(img)
-    plt.title("Sample Image from Dataset")
-    plt.axis('off')
-    plt.savefig('sample_image.png', bbox_inches='tight', dpi=150)
-    plt.close()
-    print("✓ Saved: sample_image.png")
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
+# ==================== Main Training Script ====================
 def main():
-    """Main training pipeline."""
+    config = Config()
     
-    print("\n" + "="*70)
-    print("ELEC 475 LAB 4: CLIP TRAINING")
-    print("="*70 + "\n")
+    # Create necessary directories
+    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
     
-    # Check Kaggle and download dataset
-    check_kaggle()
-    download_dataset()
+    print(f"Using device: {config.DEVICE}")
+    print(f"Training subset size: {config.TRAIN_SUBSET_SIZE}")
+    print(f"Validation subset size: {config.VAL_SUBSET_SIZE}")
     
-    # Load CLIP text encoder
-    print("\nLoading CLIP text encoder...")
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
-    text_encoder = text_encoder.to(device).eval()
+    # Step 1: Cache text embeddings (only needs to be done once)
+    print("\n=== Step 1: Caching text embeddings ===")
+    cache_text_embeddings(config)
     
-    for param in text_encoder.parameters():
-        param.requires_grad = False
-    print("✓ Text encoder loaded and frozen")
-    
-    # Create text caches
-    print("\nCreating text embedding caches...")
-    train_cache = create_text_cache(TRAIN_CAPTION_FILE, tokenizer,
-                                    text_encoder, device, "train_text_cache.pt")
-    val_cache = create_text_cache(VAL_CAPTION_FILE, tokenizer,
-                                  text_encoder, device, "val_text_cache.pt")
-    
-    # Prepare datasets
-    print("\nPreparing datasets...")
+    # Step 2: Create datasets
+    print("\n=== Step 2: Creating datasets ===")
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+        transforms.Normalize(mean=config.CLIP_MEAN, std=config.CLIP_STD)
     ])
     
-    train_dataset = COCODataset(TRAIN_IMG_DIR, TRAIN_CAPTION_FILE,
-                               transform, train_cache)
-    val_dataset = COCODataset(VAL_IMG_DIR, VAL_CAPTION_FILE,
-                             transform, val_cache)
-    
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'],
-                             shuffle=True, num_workers=CONFIG['num_workers'],
-                             pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'],
-                           shuffle=False, num_workers=CONFIG['num_workers'],
-                           pin_memory=True)
-    
-    print(f"  Train batches: {len(train_loader)}")
-    print(f"  Val batches: {len(val_loader)}")
-    
-    # Visualize sample
-    print("\nGenerating sample visualization...")
-    visualize_sample(train_dataset)
-    
-    # Initialize model
-    print("\nInitializing model...")
-    model = CLIPImageEncoder(CONFIG['embedding_dim']).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Total parameters: {n_params:,}")
-    print(f"  Trainable parameters: {n_trainable:,}")
-    
-    # Loss and optimizer
-    criterion = InfoNCELoss(CONFIG['temperature'])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=CONFIG['num_epochs']
+    train_dataset = COCOCLIPDataset(
+        config.TRAIN_IMG_DIR,
+        os.path.join(config.CACHE_DIR, 'train_text_embeddings.pt'),
+        transform=transform
     )
     
-    # Training loop
-    print("\n" + "="*70)
-    print("STARTING TRAINING")
-    print("="*70 + "\n")
+    val_dataset = COCOCLIPDataset(
+        config.VAL_IMG_DIR,
+        os.path.join(config.CACHE_DIR, 'val_text_embeddings.pt'),
+        transform=transform
+    )
     
-    train_losses, val_losses = [], []
-    start_time = time.time()
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
     
-    for epoch in range(1, CONFIG['num_epochs'] + 1):
-        print(f"\nEpoch {epoch}/{CONFIG['num_epochs']}")
-        print("-" * 70)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    # Step 3: Initialize model
+    print("\n=== Step 3: Initializing model ===")
+    model = CLIPModel(embedding_dim=config.EMBEDDING_DIM).to(config.DEVICE)
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.LEARNING_RATE,
+        weight_decay=0.01
+    )
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=config.NUM_EPOCHS
+    )
+    
+    # Step 4: Training loop
+    print("\n=== Step 4: Training ===")
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    
+    for epoch in range(1, config.NUM_EPOCHS + 1):
+        print(f"\nEpoch {epoch}/{config.NUM_EPOCHS}")
         
-        train_loss = train_epoch(model, train_loader, criterion,
-                                optimizer, device, epoch)
-        val_loss = validate(model, val_loader, criterion, device)
-        scheduler.step()
-        
+        # Train
+        train_loss = train_one_epoch(model, train_loader, optimizer, config.DEVICE, epoch)
         train_losses.append(train_loss)
+        
+        # Validate
+        val_loss, image_embeds, text_embeds = validate(model, val_loader, config.DEVICE)
         val_losses.append(val_loss)
         
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        # Compute metrics
+        similarity_matrix = image_embeds @ text_embeds.T
+        metrics = compute_recall_at_k(similarity_matrix)
+        
+        print(f"Train Loss: {train_loss:.4f}")
+        print(f"Val Loss: {val_loss:.4f}")
+        for metric, value in metrics.items():
+            print(f"{metric}: {value:.4f}")
         
         # Save checkpoint
-        if epoch % 2 == 0 or epoch == CONFIG['num_epochs']:
-            checkpoint = {
+        if epoch % config.SAVE_EVERY == 0 or val_loss < best_val_loss:
+            checkpoint_path = os.path.join(
+                config.CHECKPOINT_DIR,
+                f'clip_model_epoch_{epoch}.pt'
+            )
+            torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
                 'val_loss': val_loss,
-                'config': CONFIG
-            }
-            torch.save(checkpoint, f'checkpoint_epoch_{epoch}.pt')
-            print(f"✓ Saved: checkpoint_epoch_{epoch}.pt")
+                'metrics': metrics
+            }, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_path = os.path.join(config.CHECKPOINT_DIR, 'best_model.pt')
+                torch.save(model.state_dict(), best_model_path)
+        
+        scheduler.step()
     
-    training_time = time.time() - start_time
+    # Plot training curves
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+    plt.savefig(os.path.join(config.CHECKPOINT_DIR, 'loss_curve.png'))
+    plt.close()
     
-    print("\n" + "="*70)
-    print("TRAINING COMPLETE!")
-    print(f"Total time: {training_time/3600:.2f} hours")
-    print("="*70)
-    
-    # Save final model
-    torch.save(model.state_dict(), 'clip_resnet50_final.pt')
-    print("\n✓ Saved: clip_resnet50_final.pt")
-    
-    # Plot loss curves
-    print("\nGenerating loss curves...")
-    plot_loss_curves(train_losses, val_losses)
-    
-    # Evaluate
-    print("\n" + "="*70)
-    print("EVALUATING RETRIEVAL PERFORMANCE")
-    print("="*70 + "\n")
-    
-    metrics = evaluate_retrieval(model, val_loader, device,
-                                n_samples=CONFIG['eval_samples'])
-    
-    print(f"Recall Metrics ({CONFIG['eval_samples']} validation samples):")
-    print("-" * 70)
-    for metric, value in metrics.items():
-        print(f"  {metric}: {value:.4f} ({value*100:.2f}%)")
-    
-    # Save metrics
-    with open('training_results.txt', 'w') as f:
-        f.write("="*70 + "\n")
-        f.write("ELEC 475 Lab 4: Training Results\n")
-        f.write("="*70 + "\n\n")
-        f.write("Configuration:\n")
-        for k, v in CONFIG.items():
-            f.write(f"  {k}: {v}\n")
-        f.write(f"\nTraining Time: {training_time/3600:.2f} hours\n")
-        f.write(f"Final Train Loss: {train_losses[-1]:.4f}\n")
-        f.write(f"Final Val Loss: {val_losses[-1]:.4f}\n\n")
-        f.write("Recall Metrics:\n")
-        for metric, value in metrics.items():
-            f.write(f"  {metric}: {value:.4f} ({value*100:.2f}%)\n")
-    
-    print("\n✓ Saved: training_results.txt")
-    
-    print("\n" + "="*70)
-    print("LAB 4 TRAINING COMPLETE!")
-    print("="*70)
-    print("\nGenerated files:")
-    print("  - clip_resnet50_final.pt")
-    print("  - checkpoint_epoch_*.pt")
-    print("  - loss_curves.png")
-    print("  - sample_image.png")
-    print("  - training_results.txt")
-    print("  - train_text_cache.pt, val_text_cache.pt")
-    print("\nNext step: Run test.py for visualization and evaluation")
+    print("\n=== Training Complete ===")
+    print(f"Best validation loss: {best_val_loss:.4f}")
 
 if __name__ == "__main__":
     main()

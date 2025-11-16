@@ -1,1 +1,1 @@
-python train.py
+python /content/drive/MyDrive/ELEC475_Lab_4/train.py
